@@ -85,10 +85,14 @@ package final class Libevent2TCPConnection : TCPConnection {
 		bufferevent_setwatermark(m_ctx.event, EV_READ, 0, 65536);
 	}
 
-	/*~this()
+	~this()
 	{
+		if (m_ctx && m_ctx.state == ConnectionState.passiveClose) {
+			if (m_ctx.event) bufferevent_free(m_ctx.event);
+			TCPContextAlloc.free(m_ctx);
+		}
 		//assert(m_ctx is null, "Leaking TCPContext because it has not been cleaned up and we are not allowed to touch the GC in finalizers..");
-	}*/
+	}
 
 	@property void tcpNoDelay(bool enabled)
 	{
@@ -377,6 +381,11 @@ package final class Libevent2TCPConnection : TCPConnection {
 	void finalize()
 	{
 		flush();
+		if (m_ctx && m_ctx.state == ConnectionState.passiveClose) {
+			if (m_ctx.event) bufferevent_free(m_ctx.event);
+			TCPContextAlloc.free(m_ctx);
+			m_ctx = null;
+		}
 	}
 
 	private void acquireReader() { assert(m_ctx.readOwner == Task(), "Acquiring reader of already owned connection."); m_ctx.readOwner = Task.getThis(); }
