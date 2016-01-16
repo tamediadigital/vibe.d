@@ -14,6 +14,7 @@ public import vibe.db.mongo.database;
 import vibe.core.connectionpool;
 import vibe.core.log;
 import vibe.db.mongo.connection;
+import vibe.db.mongo.settings;
 
 import core.thread;
 
@@ -56,6 +57,18 @@ final class MongoClient {
 
 		if(!goodUrl) throw new Exception("Unable to parse mongodb URL: " ~ url);
 
+		m_connections = new ConnectionPool!MongoConnection({
+			auto ret = new MongoConnection(settings);
+			ret.connect();
+			return ret;
+		});
+
+		// force a connection to cause an exception for wrong URLs
+		lockConnection();
+	}
+
+	package this(MongoClientSettings settings)
+	{
 		m_connections = new ConnectionPool!MongoConnection({
 			auto ret = new MongoConnection(settings);
 			ret.connect();
@@ -116,7 +129,7 @@ final class MongoClient {
 
 
 	/**
-	 	Return string array representing all current database names.
+	 	Return a handle to all databases of the server.
 
 	 	Returns:
 	 		An input range of $(D MongoDatabase) objects.

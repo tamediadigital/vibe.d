@@ -39,13 +39,33 @@ ubyte[] readLine()(InputStream stream, size_t max_bytes = size_t.max, string lin
 /// ditto
 void readLine()(InputStream stream, OutputStream dst, size_t max_bytes = size_t.max, string linesep = "\r\n")
 {
-	readUntil(stream, dst, max_bytes, linesep);
+	readUntil(stream, dst, cast(const(ubyte)[])linesep, max_bytes);
 }
 /// ditto
 void readLine(R)(InputStream stream, ref R dst, size_t max_bytes = size_t.max, string linesep = "\r\n")
 	if (isOutputRange!(R, ubyte))
 {
-	readUntil(stream, dst, max_bytes, linesep);
+	readUntil(stream, dst, cast(const(ubyte)[])linesep, max_bytes);
+}
+
+unittest {
+	auto inp = new MemoryStream(cast(ubyte[])"Hello, World!\r\nThis is a test.\r\nNot a full line.".dup);
+	assert(inp.readLine() == cast(const(ubyte)[])"Hello, World!");
+	assert(inp.readLine() == cast(const(ubyte)[])"This is a test.");
+	assertThrown(inp.readLine);
+
+	// start over
+	inp.seek(0);
+
+	// read into an output buffer
+	auto app = appender!(ubyte[]);
+	inp.readLine(app);
+	assert(app.data == cast(const(ubyte)[])"Hello, World!");
+
+	// read into an output stream
+	auto os = new MemoryOutputStream;
+	inp.readLine(os);
+	assert(os.data == cast(const(ubyte)[])"This is a test.");
 }
 
 
@@ -164,7 +184,7 @@ void readUntil(R)(InputStream stream, ref R dst, in ubyte[] end_marker, ulong ma
 
 		// go through the current block trying to match the marker
 		size_t i = 0;
-		for( i = 0; i < str.length; i++ ){
+		for (i = 0; i < str.length; i++) {
 			auto ch = str[i];
 			// if we have a mismatch, use the jump table to try other possible prefixes
 			// of the marker
@@ -172,14 +192,11 @@ void readUntil(R)(InputStream stream, ref R dst, in ubyte[] end_marker, ulong ma
 				nmatched -= nmatchoffset[nmatched];
 
 			// if we then have a match, increase the match count and test for full match
-			if( ch == end_marker[nmatched] ){
-				if( ++nmatched == end_marker.length ){
-					// in case of a full match skip data in the stream until the end of
-					// the marker
-					skip(++i - nread);
+			if (ch == end_marker[nmatched])
+				if (++nmatched == end_marker.length) {
+					i++;
 					break;
 				}
-			}
 		}
 
 
@@ -193,7 +210,12 @@ void readUntil(R)(InputStream stream, ref R dst, in ubyte[] end_marker, ulong ma
 		if( nmatched < i ) dst.put(str[0 .. i-nmatched]);
 
 		// got a full, match => out
-		if( nmatched >= end_marker.length ) return;
+		if (nmatched >= end_marker.length) {
+			// in case of a full match skip data in the stream until the end of
+			// the marker
+			skip(i - nread);
+			return;
+		}
 
 		// otherwise skip this block in the stream
 		skip(str.length - nread);

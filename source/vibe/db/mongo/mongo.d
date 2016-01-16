@@ -17,6 +17,7 @@
 module vibe.db.mongo.mongo;
 
 public import vibe.db.mongo.client;
+public import vibe.db.mongo.settings;
 
 import std.algorithm;
 
@@ -66,6 +67,7 @@ import std.algorithm;
 		host = Specifies the host name or IP address of the MongoDB server.
 		port = Can be used to specify the port of the MongoDB server if different from the default one.
 		host_or_url = Can either be a host name, in which case the default port will be used, or a URL with the mongodb:// scheme.
+		settings = An object containing the full set of possible configuration options.
 
 	Returns:
 		A new MongoClient instance that can be used to access the database.
@@ -86,7 +88,11 @@ MongoClient connectMongoDB(string host_or_url)
 	if(host_or_url.startsWith("mongodb://")){
 		return new MongoClient(host_or_url);
 	} else {
-		return new MongoClient(host_or_url, MongoConnection.defaultPort);
+		return new MongoClient(host_or_url, MongoClientSettings.defaultPort);
 	}
 }
-
+/// ditto
+MongoClient connectMongoDB(MongoClientSettings settings)
+{
+	return new MongoClient(settings);
+}

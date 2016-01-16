@@ -540,7 +540,6 @@ enum SessionOption {
 final class HTTPServerRequest : HTTPRequest {
 	private {
 		SysTime m_timeCreated;
-		FixedAppender!(string, 31) m_dateAppender;
 		HTTPServerSettings m_settings;
 		ushort m_port;
 	}
@@ -617,7 +616,7 @@ final class HTTPServerRequest : HTTPRequest {
 			to store the value of any named placeholders.
 		*/
 		import vibe.utils.dictionarylist;
-		DictionaryList!string params;
+		DictionaryList!(string, true, 8) params;
 
 		/** Supplies the request body as a stream.
 
@@ -683,8 +682,6 @@ final class HTTPServerRequest : HTTPRequest {
 	{
 		m_timeCreated = time.toUTC();
 		m_port = port;
-		writeRFC822DateTimeString(m_dateAppender, time);
-		this.headers["Date"] = m_dateAppender.data();
 	}
 
 	/** Time when this request started processing.
@@ -913,6 +910,7 @@ final class HTTPServerResponse : HTTPResponse {
 		}
 		assert(!headerWritten);
 		writeHeader();
+		m_conn.flush();
 	}
 
 	/** A stream for writing the body of the HTTP response.
@@ -1087,7 +1085,7 @@ final class HTTPServerResponse : HTTPResponse {
 	*/
 	void terminateSession()
 	{
-		assert(m_session, "Try to terminate a session, but none is started.");
+		if (!m_session) return;
 		auto cookie = setCookie(m_settings.sessionIdCookie, null, m_session.get!string("$sessionCookiePath"));
 		cookie.secure = m_session.get!bool("$sessionCookieSecure");
 		m_session.destroy();
@@ -1209,8 +1207,13 @@ final class HTTPServerResponse : HTTPResponse {
 			this.statusPhrase.length ? this.statusPhrase : httpStatusText(this.statusCode));
 
 		// write all normal headers
-		foreach (k, v; this.headers)
-			writeLine("%s: %s", k, v);
+		foreach (k, v; this.headers) {
+			dst.put(k);
+			dst.put(": ");
+			dst.put(v);
+			dst.put("\r\n");
+			logTrace("%s: %s", k, v);
+		}
 
 		logTrace("---------------------");
 
@@ -1223,8 +1226,6 @@ final class HTTPServerResponse : HTTPResponse {
 
 		// finalize response header
 		dst.put("\r\n");
-		dst.flush();
-		m_conn.flush();
 	}
 }
 
@@ -1418,7 +1419,9 @@ private void listenHTTPPlain(HTTPServerSettings settings)
 					handleHTTPConnection(conn, listen_info);
 				}, listen_info.bindAddress, dist ? TCPListenOptions.distribute : TCPListenOptions.defaults);
 			auto proto = listen_info.tlsContext ? "https" : "http";
-			logInfo("Listening for requests on %s://%s:%s", proto, listen_info.bindAddress, listen_info.bindPort);
+			auto urladdr = listen_info.bindAddress;
+			if (urladdr.canFind(':')) urladdr = "["~urladdr~"]";
+			logInfo("Listening for requests on %s://%s:%s/", proto, urladdr, listen_info.bindPort);
 			return ret;
 		} catch( Exception e ) {
 			logWarn("Failed to listen on %s:%s", listen_info.bindAddress, listen_info.bindPort);
@@ -1484,6 +1487,11 @@ private void listenHTTPPlain(HTTPServerSettings settings)
 					any_successful = true;
 					g_listeners ~= linfo;
 				}
+			}
+			if (settings.hostName.length) {
+				auto proto = settings.tlsContext ? "https" : "http";
+				auto port = settings.tlsContext && settings.port == 443 || !settings.tlsContext && settings.port == 80 ? "" : ":" ~ settings.port.to!string;
+				logInfo("Added virtual host %s://%s%s/ (%s)", proto, settings.hostName, port, addr);
 			}
 		}
 	}

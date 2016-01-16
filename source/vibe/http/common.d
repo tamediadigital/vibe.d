@@ -431,7 +431,7 @@ final class ChunkedOutputStream : OutputStream {
 	private {
 		OutputStream m_out;
 		AllocAppender!(ubyte[]) m_buffer;
-		size_t m_maxBufferSize = 512*1024;
+		size_t m_maxBufferSize = 4*1024;
 		bool m_finalized = false;
 		ChunkExtensionCallback m_chunkExtensionCallback = null;
 	}
@@ -468,7 +468,7 @@ final class ChunkedOutputStream : OutputStream {
 	/// ditto
 	@property void chunkExtensionCallback(ChunkExtensionCallback cb) { m_chunkExtensionCallback = cb; }
 
-	private void append(scope void delegate(scope ubyte[] dst) del, ulong nbytes)
+	private void append(scope void delegate(scope ubyte[] dst) del, size_t nbytes)
 	{
 		assert(del !is null);
 		auto sz = nbytes;
@@ -517,7 +517,7 @@ final class ChunkedOutputStream : OutputStream {
 				append((scope ubyte[] dst) {
 						nbytes -= dst.length;
 						data.read(dst);
-					}, nbytes);
+					}, min(nbytes, size_t.max));
 				if (nbytes > 0)
 					flush();
 			}
@@ -778,17 +778,46 @@ struct CookieValueMap {
 		return 0;
 	}
 
-	/*inout(string)* opBinaryRight(string op)(string name) inout if(op == "in")
+	auto opBinaryRight(string op)(string name) if(op == "in")
 	{
-		foreach(ref c; m_entries)
-			if( c.name == name ) {
-				static if (__VERSION__ < 2066)
-					return cast(inout(string)*)&c.value;
-				else
-					return &c.value;
-			}
-		return null;
-	}*/
+		return Ptr(&this, name);
+	}
+
+	auto opBinaryRight(string op)(string name) const if(op == "in")
+	{
+		return const(Ptr)(&this, name);
+	}
+
+	private static struct Ref {
+		private {
+			CookieValueMap* map;
+			string name;
+		}
+
+		@property string get() const { return (*map)[name]; }
+		void opAssign(string newval) {
+			foreach (ref c; *map)
+				if (c.name == name) {
+					c.value = newval;
+					return;
+				}
+			assert(false);
+		}
+		alias get this;
+	}
+	private static struct Ptr {
+		private {
+			CookieValueMap* map;
+			string name;
+		}
+		bool opCast() const {
+			foreach (ref c; map.m_entries)
+				if (c.name == name)
+					return true;
+			return false;
+		}
+		inout(Ref) opUnary(string op : "*")() inout { return inout(Ref)(map, name); }
+	}
 }
 
 unittest {
@@ -798,4 +827,11 @@ unittest {
 
 	m["foo"] = "bar";
 	assert(m.getAll("foo") == ["bar;baz%1", "bar"]);
+
+	assert("foo" in m);
+	if (auto val = "foo" in m) {
+		assert(*val == "bar;baz%1");
+	} else assert(false);
+	*("foo" in m) = "baz";
+	assert(m["foo"] == "baz");
 }
