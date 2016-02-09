@@ -54,11 +54,12 @@ private {
 }
 
 package final class Libevent2TCPConnection : TCPConnection {
+	import vibe.utils.array : FixedRingBuffer;
 	private {
 		bool m_timeout_triggered;
 		TCPContext* m_ctx;
+		FixedRingBuffer!(ubyte, 4096, false) m_readBuffer;
 		string m_peerAddress;
-		ubyte[64] m_peekBuffer;
 		bool m_tcpNoDelay = false;
 		bool m_tcpKeepAlive = false;
 		Duration m_readTimeout;
@@ -102,7 +103,7 @@ package final class Libevent2TCPConnection : TCPConnection {
 		auto fd = m_ctx.socketfd;
 		int opt = enabled;
 		assert(fd <= int.max, "Socket descriptor > int.max");
-		setsockopt(cast(int)fd, IPPROTO_TCP, TCP_NODELAY, cast(ubyte*)&opt, opt.sizeof);
+		setsockopt(cast(int)fd, IPPROTO_TCP, TCP_NODELAY, cast(char*)&opt, opt.sizeof);
 	}
 	@property bool tcpNoDelay() const { return m_tcpNoDelay; }
 
@@ -173,10 +174,7 @@ package final class Libevent2TCPConnection : TCPConnection {
 		// acquire read+write access
 		acquire();
 
-		scope (exit) {
-			TCPContextAlloc.free(m_ctx);
-			m_ctx = null;
-		}
+		scope (exit) cleanup();
 
 		if (m_ctx.event) {
 			logDiagnostic("Actively closing TCP connection");
@@ -207,34 +205,23 @@ package final class Libevent2TCPConnection : TCPConnection {
 	@property ulong leastSize()
 	{
 		if (!m_ctx || !m_ctx.event) return 0;
+		if (m_readBuffer.length) {
+			checkReader();
+			return m_readBuffer.length;
+		}
 		acquireReader();
 		scope(exit) releaseReader();
-		auto inbuf = bufferevent_get_input(m_ctx.event);
-		size_t len;
-		while ((len = evbuffer_get_length(inbuf)) == 0) {
-			if (!connected) {
-				if (m_ctx && m_ctx.status == ConnectionState.passiveClose) {
-					logDiagnostic("TCP connection terminated in leastSize after passive close");
-					if (m_ctx.event) bufferevent_free(m_ctx.event);
-					TCPContextAlloc.free(m_ctx);
-					m_ctx = null;
-				}
-				return 0;
-			}
-			logTrace("leastSize waiting for new data.");
-			m_ctx.core.yieldForEvent();
-		}
-		return len;
+		fillReadBuffer(true, false);
+		return m_readBuffer.length;
 	}
 
 	@property bool dataAvailableForRead()
 	{
 		if (!m_ctx || !m_ctx.event) return false;
-		acquireReader();
-		scope(exit) releaseReader();
-		auto inbuf = bufferevent_get_input(m_ctx.event);
-
-		return evbuffer_get_length(inbuf) > 0;
+		checkReader();
+		if (!m_readBuffer.length)
+			fillReadBuffer(false);
+		return m_readBuffer.length > 0;
 	}
 
 	@property string peerAddress() const { return m_peerAddress; }
@@ -242,14 +229,37 @@ package final class Libevent2TCPConnection : TCPConnection {
 	const(ubyte)[] peek()
 	{
 		if (!m_ctx || !m_ctx.event) return null;
+		checkReader();
+		if (!m_readBuffer.length)
+			fillReadBuffer(false);
+		return m_readBuffer.peek();
+	}
+
+	void skip(ulong count)
+	{
+		checkConnected(false);
+
+		if (m_readBuffer.length >= count) {
+			checkReader();
+			m_readBuffer.popFrontN(cast(size_t)count);
+			if (m_readBuffer.empty) m_readBuffer.clear(); // start filling at index 0 again
+			return;
+		}
+
 		acquireReader();
 		scope(exit) releaseReader();
 
-		auto inbuf = bufferevent_get_input(m_ctx.event);
-		evbuffer_iovec iovec;
-		if (evbuffer_peek(inbuf, -1, null, &iovec, 1) == 0)
-			return null;
-		return (cast(ubyte*)iovec.iov_base)[0 .. iovec.iov_len];
+		while (true) {
+			auto nbytes = min(count, m_readBuffer.length);
+			m_readBuffer.popFrontN(nbytes);
+			if (m_readBuffer.empty) m_readBuffer.clear(); // start filling at index 0 again
+			count -= nbytes;
+
+			if (!count) break;
+
+			fillReadBuffer(true);
+			checkConnected(false);
+		}
 	}
 
 	/** Reads as many bytes as 'dst' can hold.
@@ -257,19 +267,27 @@ package final class Libevent2TCPConnection : TCPConnection {
 	void read(ubyte[] dst)
 	{
 		checkConnected(false);
+
+		if (m_readBuffer.length >= dst.length) {
+			checkReader();
+			m_readBuffer.read(dst);
+			if (m_readBuffer.empty) m_readBuffer.clear(); // start filling at index 0 again
+			return;
+		}
+
 		acquireReader();
 		scope(exit) releaseReader();
-		while (dst.length > 0) {
-			checkConnected(false);
-			logTrace("evbuffer_read %d bytes (fd %d)", dst.length, m_ctx.socketfd);
-			auto nbytes = bufferevent_read(m_ctx.event, dst.ptr, dst.length);
-			logTrace(" .. got %d bytes", nbytes);
+
+		while (true) {
+			auto nbytes = min(dst.length, m_readBuffer.length);
+			m_readBuffer.read(dst[0 .. nbytes]);
+			if (m_readBuffer.empty) m_readBuffer.clear(); // start filling at index 0 again
 			dst = dst[nbytes .. $];
 
-			if( dst.length == 0 ) break;
+			if (!dst.length) break;
 
+			fillReadBuffer(true);
 			checkConnected(false);
-			m_ctx.core.yieldForEvent();
 		}
 		logTrace("read data");
 	}
@@ -279,11 +297,8 @@ package final class Libevent2TCPConnection : TCPConnection {
 		if (timeout == 0.seconds)
 			logDebug("Warning: use Duration.max as an argument to waitForData() to wait infinitely, not 0.seconds.");
 
-		if (!m_ctx || !m_ctx.event) return false;
-		assert(m_ctx !is null);
-		auto inbuf = bufferevent_get_input(m_ctx.event);
-		if (evbuffer_get_length(inbuf) > 0) return true;
-		if (m_ctx.state != ConnectionState.open) return false;
+		if (dataAvailableForRead) return true;
+		if (!m_ctx || m_ctx.state != ConnectionState.open) return false;
 
 		acquireReader();
 		scope(exit) releaseReader();
@@ -294,21 +309,16 @@ package final class Libevent2TCPConnection : TCPConnection {
 			timeval t = timeout.toTimeVal();
 			logTrace("add timeout event with %d/%d", t.tv_sec, t.tv_usec);
 			event_add(m_waitDataEvent, &t);
-			// NOTE: we don't remove the timer event at the end, but instead
-			//       just ignore timeouts that happen too late. This avoids some
-			//       synchronization overhead.
 		}
 
 		logTrace("wait for data");
 		while (m_ctx && m_ctx.event) {
-			if (evbuffer_get_length(inbuf) > 0) return true;
+			if (m_readBuffer.length) return true;
 			if (m_ctx.state != ConnectionState.open) return false;
-			if (m_timeout_triggered) {
-				logTrace(" -> timeout = %s", m_timeout_triggered);
-				return false;
-			}
-			try rawYield();
-			catch (Exception e) {
+			try {
+				if (fillReadBuffer(true, false, true))
+					return false;
+			} catch (Exception e) {
 				logDiagnostic("Connection error during waitForData: %s", e.toString());
 			}
 		}
@@ -385,7 +395,28 @@ package final class Libevent2TCPConnection : TCPConnection {
 		}
 	}
 
-	private void acquireReader() { assert(m_ctx.readOwner == Task(), "Acquiring reader of already owned connection."); m_ctx.readOwner = Task.getThis(); }
+	private bool fillReadBuffer(bool block, bool throw_on_fail = true, bool wait_for_timeout = false)
+	{
+		if (m_readBuffer.length) return false;
+		m_readBuffer.clear();
+		assert(m_readBuffer.peekDst.length > 0);
+		while (m_ctx && m_ctx.event) {
+			auto nbytes = bufferevent_read(m_ctx.event, m_readBuffer.peekDst.ptr, m_readBuffer.peekDst.length);
+			m_readBuffer.putN(nbytes);
+			if (m_readBuffer.length || !block) break;
+			if (throw_on_fail) checkConnected(false);
+			else if (!m_ctx || !m_ctx.event) return false;
+			else if (m_ctx.state != ConnectionState.open
+				&& evbuffer_get_length(bufferevent_get_input(m_ctx.event)) == 0)
+					return false;
+			if (wait_for_timeout && m_timeout_triggered) return true;
+			m_ctx.core.yieldForEvent();
+		}
+		return false;
+	}
+
+	private void checkReader() { assert(m_ctx.readOwner == Task(), "Acquiring reader of already owned connection."); }
+	private void acquireReader() { checkReader(); m_ctx.readOwner = Task.getThis(); }
 	private void releaseReader() { if (!m_ctx) return; assert(m_ctx.readOwner == Task.getThis(), "Releasing reader of unowned connection."); m_ctx.readOwner = Task(); }
 
 	private void acquireWriter() { assert(m_ctx.writeOwner == Task(), "Acquiring writer of already owned connection."); m_ctx.writeOwner = Task.getThis(); }
@@ -395,16 +426,22 @@ package final class Libevent2TCPConnection : TCPConnection {
 	{
 		enforce(m_ctx !is null, "Operating on closed TCPConnection.");
 		if (m_ctx.event is null) {
-			TCPContextAlloc.free(m_ctx);
-			m_ctx = null;
+			cleanup();
 			throw new Exception(format("Connection error while %s TCPConnection.", write ? "writing to" : "reading from"));
 		}
 		enforce (!write || m_ctx.state == ConnectionState.open, "Remote hung up while writing to TCPConnection.");
 		if (!write && m_ctx.state == ConnectionState.passiveClose) {
 			auto buf = bufferevent_get_input(m_ctx.event);
-			auto data_left = evbuffer_get_length(buf) > 0;
+			auto data_left = m_readBuffer.length > 0 || evbuffer_get_length(buf) > 0;
 			enforce(data_left, "Remote hung up while reading from TCPConnection.");
 		}
+	}
+
+	private void cleanup()
+	{
+		event_free(m_waitDataEvent);
+		TCPContextAlloc.free(m_ctx);
+		m_ctx = null;
 	}
 }
 
@@ -632,7 +669,7 @@ package nothrow extern(C)
 
 		auto f = ctx.readOwner;
 		try {
-			if (f && f.running)
+			if (f && f.running && ctx.state != ConnectionState.activeClose)
 				ctx.core.resumeTask(f);
 		} catch (UncaughtException e) {
 			logWarn("Got exception when resuming task onSocketRead: %s", e.msg);
@@ -670,17 +707,18 @@ package nothrow extern(C)
 			string errorMessage;
 			if (status & BEV_EVENT_EOF) {
 				logDebug("Connection was closed (fd %d).", ctx.socketfd);
-				ctx.state = ConnectionState.passiveClose;
+				if (ctx.state != ConnectionState.activeClose)
+					ctx.state = ConnectionState.passiveClose;
 				evbuffer* buf = bufferevent_get_input(buf_event);
 				if (evbuffer_get_length(buf) == 0) free_event = true;
 			} else if (status & BEV_EVENT_TIMEOUT) {
 				logDebug("Remote host on fd %d timed out.", ctx.socketfd);
 				free_event = true;
 			} else if (status & BEV_EVENT_ERROR) {
-				auto msg = format("Error %s socket %s",
-					(status & BEV_EVENT_READING) ? "reading from" : (status & BEV_EVENT_WRITING) ? "writing to" : "on",
-					ctx.socketfd);
-				ex = new SystemSocketException(msg);
+				//auto msg = format("Error %s socket %s",
+				//	(status & BEV_EVENT_READING) ? "reading from" : (status & BEV_EVENT_WRITING) ? "writing to" : "on",
+				//	ctx.socketfd);
+				//ex = new SystemSocketException(msg);
 				free_event = true;
 			}
 
@@ -691,7 +729,7 @@ package nothrow extern(C)
 
 			ctx.core.eventException = ex;
 
-			if (ctx.readOwner && ctx.readOwner.running) {
+			if (ctx.readOwner && ctx.readOwner.running && ctx.state != ConnectionState.activeClose) {
 				logTrace("resuming corresponding task%s...", ex is null ? "" : " with exception");
 				if (ctx.readOwner.fiber.state == Fiber.State.EXEC) ctx.exception = ex;
 				else ctx.core.resumeTask(ctx.readOwner, ex);

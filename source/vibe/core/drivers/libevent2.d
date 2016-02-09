@@ -76,6 +76,8 @@ final class Libevent2Driver : EventDriver {
 		TimerQueue!TimerInfo m_timers;
 		DList!AddressInfo m_addressInfoCache;
 		size_t m_addressInfoCacheLength = 0;
+
+		bool m_running = false; // runEventLoop in progress?
 	}
 
 	this(DriverCore core) nothrow
@@ -178,6 +180,9 @@ final class Libevent2Driver : EventDriver {
 
 	int runEventLoop()
 	{
+		m_running = true;
+		scope (exit) m_running = false;
+
 		int ret;
 		m_exit = false;
 		while (!m_exit && (ret = event_base_loop(m_eventLoop, EVLOOP_ONCE)) == 0) {
@@ -203,7 +208,8 @@ final class Libevent2Driver : EventDriver {
 		processTimers();
 		logDebugV("processed events with exit == %s", m_exit);
 		if (m_exit) {
-			m_exit = false;
+			// leave the flag set, if the event loop is still running to let it exit, too
+			if (!m_running) m_exit = false;
 			return false;
 		}
 		return true;
@@ -338,6 +344,15 @@ final class Libevent2Driver : EventDriver {
 		int tmp_reuse = 1;
 		socketEnforce(setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &tmp_reuse, tmp_reuse.sizeof) == 0,
 			"Error enabling socket address reuse on listening socket");
+		version (linux) {
+			if (options & TCPListenOptions.reusePort) {
+				if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEPORT, &tmp_reuse, tmp_reuse.sizeof)) {
+					if (errno != EINVAL && errno != ENOPROTOOPT) {
+						socketEnforce(false, "Error enabling socket port reuse on listening socket");
+					}
+				}
+			}
+		}
 		socketEnforce(bind(listenfd, bind_addr.sockAddr, bind_addr.sockAddrLen) == 0,
 			"Error binding listening socket");
 		socketEnforce(listen(listenfd, 128) == 0,
@@ -535,7 +550,9 @@ final class Libevent2Driver : EventDriver {
 	}
 
 	private void registerObject(Libevent2Object obj)
-	{
+	nothrow {
+		scope (failure) assert(false); // synchronized is not nothrow
+
 		debug assert(Thread.getThis() is m_ownerThread, "Event object created in foreign thread.");
 		auto key = cast(size_t)cast(void*)obj;
 		synchronized (s_threadObjectsMutex) {
@@ -545,7 +562,9 @@ final class Libevent2Driver : EventDriver {
 	}
 
 	private void unregisterObject(Libevent2Object obj)
-	{
+	nothrow {
+		scope (failure) assert(false); // synchronized is not nothrow
+
 		auto key = cast(size_t)cast(void*)obj;
 		synchronized (s_threadObjectsMutex) {
 			m_ownedObjects.remove(key);
@@ -583,7 +602,7 @@ private class Libevent2Object {
 	debug private Thread m_ownerThread;
 
 	this(Libevent2Driver driver)
-	{
+	nothrow {
 		m_driver = driver;
 		m_driver.registerObject(this);
 		debug m_ownerThread = driver.m_ownerThread;
@@ -616,8 +635,9 @@ final class Libevent2ManualEvent : Libevent2Object, ManualEvent {
 	}
 
 	this(Libevent2Driver driver)
-	{
+	nothrow {
 		super(driver);
+		scope (failure) assert(false);
 		m_mutex = new core.sync.mutex.Mutex;
 		m_waiters = ThreadSlotMap(manualAllocator());
 	}
