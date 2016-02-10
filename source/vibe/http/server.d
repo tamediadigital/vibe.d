@@ -206,7 +206,7 @@ void setVibeDistHost(string host, ushort port)
 {
 	import vibe.templ.diet;
 	res.headers["Content-Type"] = "text/html; charset=UTF-8";
-	parseDietFile!(template_file, ALIASES)(res.bodyWriter);
+	compileDietFile!(template_file, ALIASES)(res.bodyWriter);
 }
 
 
@@ -333,6 +333,8 @@ enum HTTPServerOption {
 		help an attacker to abuse possible security holes.
 	*/
 	errorStackTraces          = 1<<7,
+	/// Enable port reuse in listenTCP()
+	reusePort                 = 1<<8,
 
 	/** The default set of options.
 
@@ -426,6 +428,7 @@ final class HTTPServerSettings {
 	TLSContext tlsContext;
 
 	/// Compatibility alias - use `tlsContext` instead.
+	deprecated("Use tlsContext instead.")
 	alias sslContext = tlsContext;
 
 	/// Session management is enabled if a session store instance is provided
@@ -457,7 +460,8 @@ final class HTTPServerSettings {
 	{
 		auto ret = new HTTPServerSettings;
 		foreach (mem; __traits(allMembers, HTTPServerSettings)) {
-			static if (mem == "bindAddresses") ret.bindAddresses = bindAddresses.dup;
+			static if (mem == "sslContext") {}
+			else static if (mem == "bindAddresses") ret.bindAddresses = bindAddresses.dup;
 			else static if (__traits(compiles, __traits(getMember, ret, mem) = __traits(getMember, this, mem)))
 				__traits(getMember, ret, mem) = __traits(getMember, this, mem);
 		}
@@ -557,6 +561,7 @@ final class HTTPServerRequest : HTTPRequest {
 		bool tls;
 
 		/// Compatibility alias - use `tls` instead.
+		deprecated("Use .tls instead.")
 		alias ssl = tls;
 
 		/** Information about the TLS certificate provided by the client.
@@ -791,6 +796,7 @@ final class HTTPServerResponse : HTTPResponse {
 	bool tls() const { return m_tls; }
 
 	/// Compatibility alias - use `tls` instead.
+	deprecated("Use .tls instead.")
 	alias ssl = tls;
 
 	/// Writes the entire response body at once.
@@ -1095,37 +1101,6 @@ final class HTTPServerResponse : HTTPResponse {
 	@property ulong bytesWritten() { return m_countingWriter.bytesWritten; }
 
 	/**
-		Deprecated - use `render` instead.
-
-		This version of render() works around an old compiler bug in DMD < 2.064 (Issue 2962).
-
-		The first template argument is the name of the template file. All following arguments
-		must be pairs of a type and a string, each specifying one parameter. Parameter values
-		can be passed either as a value of the same type as specified by the template
-		arguments, or as a Variant which has the same type stored.
-
-		Note that the variables are copied and not referenced inside of the template - any
-		modification you do on them from within the template will get lost.
-
-		Examples:
-			---
-			string title = "Hello, World!";
-			int pageNumber = 1;
-			res.renderCompat!("mytemplate.jd",
-				string, "title",
-				int, "pageNumber")
-				(title, pageNumber);
-			---
-	*/
-	deprecated("Use the non-compatibility render() call instead.")
-	void renderCompat(string template_file, TYPES_AND_NAMES...)(...)
-	{
-		import vibe.templ.diet;
-		headers["Content-Type"] = "text/html; charset=UTF-8";
-		compileDietFileCompatV!(template_file, TYPES_AND_NAMES)(bodyWriter, _argptr, _arguments);
-	}
-
-	/**
 		Waits until either the connection closes or until the given timeout is
 		reached.
 
@@ -1412,12 +1387,15 @@ private void listenHTTPPlain(HTTPServerSettings settings)
 {
 	import std.algorithm : canFind;
 
-	static TCPListener doListen(HTTPListenInfo listen_info, bool dist)
+	static TCPListener doListen(HTTPListenInfo listen_info, bool dist, bool reusePort)
 	{
 		try {
+			TCPListenOptions options = TCPListenOptions.defaults;
+			if(dist) options |= TCPListenOptions.distribute; else options &= ~TCPListenOptions.distribute;
+			if(reusePort) options |= TCPListenOptions.reusePort; else options &= ~TCPListenOptions.reusePort;
 			auto ret = listenTCP(listen_info.bindPort, (TCPConnection conn) {
 					handleHTTPConnection(conn, listen_info);
-				}, listen_info.bindAddress, dist ? TCPListenOptions.distribute : TCPListenOptions.defaults);
+				}, listen_info.bindAddress, options);
 			auto proto = listen_info.tlsContext ? "https" : "http";
 			auto urladdr = listen_info.bindAddress;
 			if (urladdr.canFind(':')) urladdr = "["~urladdr~"]";
@@ -1480,7 +1458,7 @@ private void listenHTTPPlain(HTTPServerSettings settings)
 			}
 			if (!found_listener) {
 				auto linfo = new HTTPListenInfo(addr, settings.port, settings.tlsContext);
-				if (auto tcp_lst = doListen(linfo, (settings.options & HTTPServerOption.distribute) != 0)) // DMD BUG 2043
+				if (auto tcp_lst = doListen(linfo, (settings.options & HTTPServerOption.distribute) != 0, (settings.options & HTTPServerOption.reusePort) != 0)) // DMD BUG 2043
 				{
 					linfo.listener = tcp_lst;
 					found_listener = true;
@@ -1858,17 +1836,36 @@ private void parseRequestHeader(HTTPServerRequest req, InputStream http_stream, 
 
 private void parseCookies(string str, ref CookieValueMap cookies)
 {
-	while(str.length > 0) {
-		auto idx = str.indexOf('=');
-		enforceBadRequest(idx > 0, "Expected name=value.");
-		string name = str[0 .. idx].strip();
-		str = str[idx+1 .. $];
+	import std.encoding : sanitize;
+	import std.array : split;
+	import std.string : strip;
+	import std.algorithm.iteration : map, filter, each;
+	import vibe.http.common : Cookie;
+	str.sanitize.split(";")
+		.map!(kv => kv.strip.split("="))
+		.filter!(kv => kv.length == 2) //ignore illegal cookies
+		.each!(kv => cookies.add(kv[0], kv[1], Cookie.Encoding.raw) );
+}
 
-		for (idx = 0; idx < str.length && str[idx] != ';'; idx++) {}
-		string value = str[0 .. idx].strip();
-		cookies[name] = urlDecode(value);
-		str = idx < str.length ? str[idx+1 .. $] : null;
-	}
+unittest 
+{
+  auto cvm = CookieValueMap();
+  parseCookies("foo=bar;; baz=zinga; öö=üü   ;   møøse=was=sacked;    onlyval1; =onlyval2; onlykey=", cvm);
+  assert(cvm["foo"] == "bar");
+  assert(cvm["baz"] == "zinga");
+  assert(cvm["öö"] == "üü");
+  assert( "møøse" ! in cvm); //illegal cookie gets ignored
+  assert( "onlyval1" ! in cvm); //illegal cookie gets ignored
+  assert(cvm["onlykey"] == "");
+  assert(cvm[""] == "onlyval2");
+  assert(cvm.length() == 5);
+  cvm = CookieValueMap();
+  parseCookies("", cvm);
+  assert(cvm.length() == 0);
+  cvm = CookieValueMap();
+  parseCookies(";;=", cvm);
+  assert(cvm.length() == 1);
+  assert(cvm[""] == "");
 }
 
 shared static this()

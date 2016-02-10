@@ -53,7 +53,10 @@ else
 
 version(Windows)
 {
-	import std.c.windows.winsock;
+	static if (__VERSION__ >= 2070)
+		import core.sys.windows.winsock2;
+	else
+		import std.c.windows.winsock;
 
 	alias EWOULDBLOCK = WSAEWOULDBLOCK;
 }
@@ -76,6 +79,8 @@ final class Libevent2Driver : EventDriver {
 		TimerQueue!TimerInfo m_timers;
 		DList!AddressInfo m_addressInfoCache;
 		size_t m_addressInfoCacheLength = 0;
+
+		bool m_running = false; // runEventLoop in progress?
 	}
 
 	this(DriverCore core) nothrow
@@ -162,6 +167,11 @@ final class Libevent2Driver : EventDriver {
 				auto obj = cast(Libevent2Object)cast(void*)key;
 				debug assert(obj.m_ownerThread !is m_ownerThread, "Live object of this thread detected after all owned mutexes have been destroyed.");
 				debug assert(obj.m_driver !is this, "Live object of this driver detected with different thread ID after all owned mutexes have been destroyed.");
+				// WORKAROUND for a possible race-condition in case of concurrent GC collections
+				// Since this only occurs on shutdown and rarely, this should be an acceptable
+				// "solution" until this is all switched to RC.
+				if (auto me = cast(Libevent2ManualEvent)obj)
+					if (!me.m_mutex) continue;
 				obj.onThreadShutdown();
 			}
 		}
@@ -178,6 +188,9 @@ final class Libevent2Driver : EventDriver {
 
 	int runEventLoop()
 	{
+		m_running = true;
+		scope (exit) m_running = false;
+
 		int ret;
 		m_exit = false;
 		while (!m_exit && (ret = event_base_loop(m_eventLoop, EVLOOP_ONCE)) == 0) {
@@ -203,7 +216,8 @@ final class Libevent2Driver : EventDriver {
 		processTimers();
 		logDebugV("processed events with exit == %s", m_exit);
 		if (m_exit) {
-			m_exit = false;
+			// leave the flag set, if the event loop is still running to let it exit, too
+			if (!m_running) m_exit = false;
 			return false;
 		}
 		return true;
@@ -338,6 +352,15 @@ final class Libevent2Driver : EventDriver {
 		int tmp_reuse = 1;
 		socketEnforce(setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &tmp_reuse, tmp_reuse.sizeof) == 0,
 			"Error enabling socket address reuse on listening socket");
+		version (linux) {
+			if (options & TCPListenOptions.reusePort) {
+				if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEPORT, &tmp_reuse, tmp_reuse.sizeof)) {
+					if (errno != EINVAL && errno != ENOPROTOOPT) {
+						socketEnforce(false, "Error enabling socket port reuse on listening socket");
+					}
+				}
+			}
+		}
 		socketEnforce(bind(listenfd, bind_addr.sockAddr, bind_addr.sockAddrLen) == 0,
 			"Error binding listening socket");
 		socketEnforce(listen(listenfd, 128) == 0,
@@ -535,7 +558,9 @@ final class Libevent2Driver : EventDriver {
 	}
 
 	private void registerObject(Libevent2Object obj)
-	{
+	nothrow {
+		scope (failure) assert(false); // synchronized is not nothrow
+
 		debug assert(Thread.getThis() is m_ownerThread, "Event object created in foreign thread.");
 		auto key = cast(size_t)cast(void*)obj;
 		synchronized (s_threadObjectsMutex) {
@@ -545,7 +570,9 @@ final class Libevent2Driver : EventDriver {
 	}
 
 	private void unregisterObject(Libevent2Object obj)
-	{
+	nothrow {
+		scope (failure) assert(false); // synchronized is not nothrow
+
 		auto key = cast(size_t)cast(void*)obj;
 		synchronized (s_threadObjectsMutex) {
 			m_ownedObjects.remove(key);
@@ -583,7 +610,7 @@ private class Libevent2Object {
 	debug private Thread m_ownerThread;
 
 	this(Libevent2Driver driver)
-	{
+	nothrow {
 		m_driver = driver;
 		m_driver.registerObject(this);
 		debug m_ownerThread = driver.m_ownerThread;
@@ -616,14 +643,16 @@ final class Libevent2ManualEvent : Libevent2Object, ManualEvent {
 	}
 
 	this(Libevent2Driver driver)
-	{
+	nothrow {
 		super(driver);
+		scope (failure) assert(false);
 		m_mutex = new core.sync.mutex.Mutex;
 		m_waiters = ThreadSlotMap(manualAllocator());
 	}
 
 	~this()
 	{
+		m_mutex = null; // Optimistic race-condition detection (see Libevent2Driver.dispose())
 		foreach (ref m_waiters.Value ts; m_waiters)
 			event_free(ts.event);
 	}
@@ -1215,8 +1244,6 @@ package DriverCore getThreadLibeventDriverCore() nothrow
 private int getLastSocketError() nothrow
 {
 	version(Windows) {
-		static if (__VERSION__ < 2066)
-			scope (failure) assert(false); // assert nothrow condition
 		return WSAGetLastError();
 	} else {
 		import core.stdc.errno;
@@ -1446,12 +1473,7 @@ private nothrow extern(C)
 package timeval toTimeVal(Duration dur)
 {
 	timeval tvdur;
-	static if (__VERSION__ < 2066) {
-		tvdur.tv_sec = cast(int)dur.total!"seconds"();
-		tvdur.tv_usec = dur.fracSec().usecs();
-	} else {
-		dur.split!("seconds", "usecs")(tvdur.tv_sec, tvdur.tv_usec);
-	}
+	dur.split!("seconds", "usecs")(tvdur.tv_sec, tvdur.tv_usec);
 	return tvdur;
 }
 

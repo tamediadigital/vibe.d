@@ -268,11 +268,11 @@ Task runWorkerTaskH(FT, ARGS...)(FT func, auto ref ARGS args)
 	assert(caller != Task.init, "runWorkderTaskH can currently only be called from within a task.");
 	static void taskFun(Task caller, FT func, ARGS args) {
 		PrivateTask callee = Task.getThis();
-		caller.prioritySend(callee);
+		caller.prioritySendCompat(callee);
 		mixin(callWithMove!ARGS("func", "args"));
 	}
 	runWorkerTask_unsafe(&taskFun, caller, func, args);
-	return cast(Task)receiveOnly!PrivateTask();
+	return cast(Task)receiveOnlyCompat!PrivateTask();
 }
 /// ditto
 Task runWorkerTaskH(alias method, T, ARGS...)(shared(T) object, auto ref ARGS args)
@@ -296,11 +296,11 @@ Task runWorkerTaskH(alias method, T, ARGS...)(shared(T) object, auto ref ARGS ar
 	assert(caller != Task.init, "runWorkderTaskH can currently only be called from within a task.");
 	static void taskFun(Task caller, FT func, ARGS args) {
 		PrivateTask callee = Task.getThis();
-		caller.prioritySend(callee);
+		caller.prioritySendCompat(callee);
 		mixin(callWithMove!ARGS("func", "args"));
 	}
 	runWorkerTask_unsafe(&taskFun, caller, func, args);
-	return cast(Task)receiveOnly!PrivateTask();
+	return cast(Task)receiveOnlyCompat!PrivateTask();
 }
 
 /// Running a worker task using a function
@@ -343,11 +343,11 @@ unittest {
 	static void workerFunc(Task caller)
 	{
 		int counter = 10;
-		while (receiveOnly!string() == "ping" && --counter) {
+		while (receiveOnlyCompat!string() == "ping" && --counter) {
 			logInfo("pong");
-			caller.send("pong");
+			caller.sendCompat("pong");
 		}
-		caller.send("goodbye");
+		caller.sendCompat("goodbye");
 
 	}
 
@@ -356,8 +356,8 @@ unittest {
 		Task callee = runWorkerTaskH(&workerFunc, Task.getThis);
 		do {
 			logInfo("ping");
-			callee.send("ping");
-		} while (receiveOnly!string() == "pong");
+			callee.sendCompat("ping");
+		} while (receiveOnlyCompat!string() == "pong");
 	}
 
 	static void work719(int) {}
@@ -369,11 +369,11 @@ unittest {
 	static class Test {
 		void workerMethod(Task caller) shared {
 			int counter = 10;
-			while (receiveOnly!string() == "ping" && --counter) {
+			while (receiveOnlyCompat!string() == "ping" && --counter) {
 				logInfo("pong");
-				caller.send("pong");
+				caller.sendCompat("pong");
 			}
-			caller.send("goodbye");
+			caller.sendCompat("goodbye");
 		}
 	}
 
@@ -383,8 +383,8 @@ unittest {
 		Task callee = runWorkerTaskH!(Test.workerMethod)(cls, Task.getThis());
 		do {
 			logInfo("ping");
-			callee.send("ping");
-		} while (receiveOnly!string() == "pong");
+			callee.sendCompat("ping");
+		} while (receiveOnlyCompat!string() == "pong");
 	}
 
 	static class Class719 {
@@ -801,7 +801,7 @@ void setTaskEventCallback(TaskEventCb func)
 /**
 	A version string representing the current vibe version
 */
-enum vibeVersionString = "0.7.26";
+enum vibeVersionString = "0.7.27";
 
 
 /**
@@ -1071,6 +1071,10 @@ private class CoreTask : TaskFiber {
 				try {
 					m_running = true;
 					scope(exit) m_running = false;
+
+					static if (newStdConcurrency)
+						std.concurrency.thisTid; // force creation of a new Tid
+
 					debug if (s_taskEventCallback) s_taskEventCallback(TaskEvent.start, handle);
 					if (!s_eventLoopRunning) {
 						logTrace("Event loop not running at task start - yielding.");
@@ -1085,6 +1089,9 @@ private class CoreTask : TaskFiber {
 					logCritical("Task terminated with uncaught exception: %s", e.msg);
 					logDebug("Full error: %s", e.toString().sanitize());
 				}
+
+				static if (newStdConcurrency)
+					this.tidInfo.ident = Tid.init; // reset Tid
 
 				// check for any unhandled deferred exceptions
 				if (m_exception !is null) {
@@ -1241,7 +1248,9 @@ private class VibeDriverCore : DriverCore {
 		else
 			auto uncaught_exception = () @trusted nothrow { scope (failure) assert(false); return ctask.call(false); } ();
 
-		if (auto th = cast(Throwable)uncaught_exception) {
+		if (uncaught_exception) {
+			auto th = cast(Throwable)uncaught_exception;
+			assert(th, "Fiber returned exception object that is not a Throwable!?");
 			extrap();
 
 			assert(() @trusted nothrow { return ctask.state; } () == Fiber.State.TERM);
@@ -1250,7 +1259,7 @@ private class VibeDriverCore : DriverCore {
 
 			// always pass Errors on
 			if (auto err = cast(Error)th) throw err;
-		} else assert(!uncaught_exception, "Fiber returned exception object that is not a Throwable!?");
+		}
 	}
 
 	void notifyIdle()
@@ -1489,8 +1498,8 @@ shared static this()
 	}
 
 	static if (newStdConcurrency) {
-		import std.concurrency;
-		scheduler = new VibedScheduler;
+		static import std.concurrency;
+		std.concurrency.scheduler = new VibedScheduler;
 	}
 }
 
@@ -1535,6 +1544,9 @@ static this()
 
 static ~this()
 {
+	// Issue #1374: Sometimes Druntime for some reason calls `static ~this` after `shared static ~this`
+	if (!s_core) return; 
+
 	version(VibeLibasyncDriver) {
 		import vibe.core.drivers.libasync;
 		if (LibasyncDriver.isControlThread)
@@ -1574,7 +1586,7 @@ static ~this()
 	st_threadShutdownCondition.notifyAll();
 }
 
-private void setupDriver()
+package void setupDriver()
 {
 	if (getEventDriver(true) !is null) return;
 
@@ -1672,9 +1684,6 @@ private extern(C) void extrap()
 @safe nothrow {
 	logTrace("exception trap");
 }
-
-// backwards compatibility with DMD < 2.066
-static if (__VERSION__ <= 2065) @property bool nogc() { return false; }
 
 private extern(C) void onSignal(int signal)
 nothrow {
